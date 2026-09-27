@@ -8,7 +8,10 @@ from litestar.exceptions import HTTPException
 from litestar.status_codes import HTTP_401_UNAUTHORIZED, HTTP_403_FORBIDDEN
 from passlib.context import CryptContext
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 from pydantic import BaseModel
+
+from domain import build_trajectory, clamp_limit
 
 DSN = os.environ.get("DATABASE_URL", "postgresql://app:app@localhost:54395/spectrum")
 SECRET = os.environ.get("JWT_SECRET", "spectrum-dev-secret")
@@ -30,6 +33,13 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_by text NOT NULL,
     created_at timestamptz NOT NULL
 );
+CREATE TABLE IF NOT EXISTS trajectory_snapshots (
+    id serial PRIMARY KEY,
+    compare_id integer,
+    payload jsonb NOT NULL,
+    created_by text NOT NULL,
+    created_at timestamptz NOT NULL
+);
 """
 
 
@@ -46,6 +56,11 @@ class JobIn(BaseModel):
     lamp: str
     nominal_nm: float
     measured_nm: float
+
+
+class SnapshotIn(BaseModel):
+    limit: int = 10
+    compare_id: int | None = None
 
 
 def user_from_request(request: Request) -> dict:
@@ -123,6 +138,97 @@ async def create_job(request: Request, data: JobIn) -> dict:
         return {"id": row["id"], "status": "pending"}
 
 
+def fetch_trajectory(conn, limit: int, compare_id: int | None) -> dict:
+    """近次已结案轨迹：按时间倒序取条数，对照点差额全在服务端算。"""
+    limit = clamp_limit(limit)
+    rows = conn.execute(
+        """
+        SELECT id, lamp, nominal_nm, measured_nm, verdict, created_at
+        FROM jobs
+        WHERE status = 'done'
+        ORDER BY created_at DESC, id DESC
+        LIMIT %s
+        """,
+        (limit,),
+    ).fetchall()
+    compare_row = None
+    if compare_id is not None:
+        compare_row = conn.execute(
+            """
+            SELECT id, lamp, nominal_nm, measured_nm, verdict, created_at
+            FROM jobs
+            WHERE id = %s AND status = 'done'
+            """,
+            (compare_id,),
+        ).fetchone()
+        if not compare_row:
+            raise HTTPException(status_code=404, detail="对照点不存在或尚未结案")
+    return build_trajectory(rows, compare_row, limit)
+
+
+@get("/api/trajectory")
+async def get_trajectory(request: Request, limit: int = 10, compare_id: int | None = None) -> dict:
+    user_from_request(request)
+    with connect() as conn:
+        return fetch_trajectory(conn, limit, compare_id)
+
+
+@post("/api/trajectory/snapshots")
+async def create_snapshot(request: Request, data: SnapshotIn) -> dict:
+    user = user_from_request(request)
+    if user["role"] != "writer":
+        raise HTTPException(status_code=HTTP_403_FORBIDDEN, detail="仅校准员可签发")
+    with connect() as conn:
+        payload = fetch_trajectory(conn, data.limit, data.compare_id)
+        row = conn.execute(
+            """
+            INSERT INTO trajectory_snapshots(compare_id, payload, created_by, created_at)
+            VALUES (%s, %s, %s, %s) RETURNING id, created_at
+            """,
+            (
+                data.compare_id,
+                Jsonb(payload),
+                user["username"],
+                datetime.now(timezone.utc),
+            ),
+        ).fetchone()
+        conn.commit()
+        return {"id": row["id"], "created_at": row["created_at"]}
+
+
+@get("/api/trajectory/snapshots")
+async def list_snapshots(request: Request) -> list:
+    user_from_request(request)
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, compare_id, created_by, created_at,
+                   jsonb_array_length(payload->'points') AS point_count
+            FROM trajectory_snapshots
+            ORDER BY id DESC
+            """
+        ).fetchall()
+        return list(rows)
+
+
+@get("/api/trajectory/snapshots/{snap_id:int}")
+async def get_snapshot(request: Request, snap_id: int) -> dict:
+    user_from_request(request)
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT id, payload, created_by, created_at FROM trajectory_snapshots WHERE id = %s",
+            (snap_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="快照不存在")
+        return {
+            "id": row["id"],
+            "created_by": row["created_by"],
+            "created_at": row["created_at"],
+            **row["payload"],
+        }
+
+
 def on_startup() -> None:
     with connect() as conn:
         conn.execute(SCHEMA)
@@ -141,4 +247,17 @@ def on_startup() -> None:
         conn.commit()
 
 
-app = Litestar(route_handlers=[health, login, list_jobs, get_job, create_job], on_startup=[on_startup])
+app = Litestar(
+    route_handlers=[
+        health,
+        login,
+        list_jobs,
+        get_job,
+        create_job,
+        get_trajectory,
+        create_snapshot,
+        list_snapshots,
+        get_snapshot,
+    ],
+    on_startup=[on_startup],
+)
