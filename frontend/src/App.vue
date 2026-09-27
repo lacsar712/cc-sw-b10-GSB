@@ -13,6 +13,8 @@ const loginForm = ref({ username: 'calibrator', password: 'calib123456' })
 
 const isHome = computed(() => route.path === '/')
 const isDetail = computed(() => route.path.startsWith('/jobs/'))
+const isTrajectory = computed(() => route.path === '/trajectory')
+const isSnapshot = computed(() => route.path.startsWith('/snapshots/'))
 
 async function login() {
   err.value = ''
@@ -52,11 +54,19 @@ function logout() {
       <nav class="nav">
         <router-link to="/" :class="{ active: isHome }">校准总览</router-link>
         <span class="nav-sep">|</span>
+        <router-link to="/trajectory" :class="{ active: isTrajectory }">轨迹台</router-link>
+        <span class="nav-sep">|</span>
         <span
           class="nav-hint"
           :class="{ active: isDetail }"
           title="请从总表点击任务行进入"
         >任务详情</span>
+        <span class="nav-sep">|</span>
+        <span
+          class="nav-hint"
+          :class="{ active: isSnapshot }"
+          title="请从轨迹台点击快照行进入"
+        >快照详情</span>
       </nav>
       <div class="user-area">
         <span>{{ user }}（{{ role }}）</span>
